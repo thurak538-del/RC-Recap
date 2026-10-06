@@ -1,0 +1,454 @@
+import os
+import subprocess
+import json
+import unicodedata
+from pathlib import Path
+from typing import List, Dict, Any, Optional, Callable
+
+from app.config import CUSTOM_FONTS_DIR, settings_manager
+from app.pipeline.gpu_utils import get_video_encoder_args, get_active_encoder_name
+from app.pipeline.burmese_text import grapheme_clusters, normalize_myanmar_text
+
+
+def hex_to_ass_color(hex_str: str) -> str:
+    hex_clean = hex_str.strip().lstrip('#')
+    if len(hex_clean) == 3:
+        hex_clean = "".join([c*2 for c in hex_clean])
+    if len(hex_clean) != 6:
+        return "&H00FFFFFF"
+    r = hex_clean[0:2]
+    g = hex_clean[2:4]
+    b = hex_clean[4:6]
+    return f"&H00{b.upper()}{g.upper()}{r.upper()}"
+
+
+def format_ass_timestamp(seconds: float) -> str:
+    hrs = int(seconds // 3600)
+    mins = int((seconds % 3600) // 60)
+    secs = int(seconds % 60)
+    centis = int(round((seconds - int(seconds)) * 100))
+    if centis >= 100:
+        centis = 99
+    return f"{hrs:d}:{mins:02d}:{secs:02d}.{centis:02d}"
+
+
+def format_srt_timestamp(seconds: float) -> str:
+    hrs = int(seconds // 3600)
+    mins = int((seconds % 3600) // 60)
+    secs = int(seconds % 60)
+    millis = int(round((seconds - int(seconds)) * 1000))
+    if millis >= 1000:
+        millis = 999
+    return f"{hrs:02d}:{mins:02d}:{secs:02d},{millis:03d}"
+
+
+def wrap_subtitle_text(text: str, max_chars: int = 28, max_lines: int = 2) -> str:
+    """Wrap rendered text at Burmese phrase boundaries, never by half-length."""
+    text = normalize_myanmar_text(" ".join(str(text).split()))
+    if max_lines != 2 or len(grapheme_clusters(text)) <= max_chars:
+        return text
+
+    particles = {"ကို", "သည်", "မှာ", "က", "နဲ့", "တွေ", "များ", "၏", "တော့", "ပဲ", "ဘဲ"}
+    words = text.split(" ")
+    candidates = []
+    for index in range(1, len(words)):
+        if words[index] in particles:
+            continue
+        left = " ".join(words[:index]).strip()
+        right = " ".join(words[index:]).strip()
+        left_len = len(grapheme_clusters(left))
+        right_len = len(grapheme_clusters(right))
+        if left_len <= max_chars and right_len <= max_chars:
+            boundary_bonus = 12 if left and left[-1] in "၊။!?…,:;—-" else 0
+            short_line_penalty = 0 if right_len >= max(4, int((left_len + right_len) * 0.28)) else 30
+            balance = abs(left_len - right_len)
+            candidates.append((balance + short_line_penalty - boundary_bonus, left, right))
+
+    if candidates:
+        _, left, right = min(candidates, key=lambda item: item[0])
+        return f"{left}\n{right}"
+
+    clusters = grapheme_clusters(text)
+    cut = min(max(1, max_chars), len(clusters) - 1)
+    return f"{''.join(clusters[:cut]).strip()}\n{''.join(clusters[cut:]).strip()}"
+
+
+def split_sequential_subtitle_segments(
+    segments: List[Dict[str, Any]], max_chars: int = 32
+) -> List[Dict[str, Any]]:
+    """Split long subtitle phrases into sequential one-line timed events."""
+    expanded: List[Dict[str, Any]] = []
+    for segment in segments:
+        text = normalize_myanmar_text(str(segment.get("text", "")).strip())
+        if not text:
+            continue
+        clusters = grapheme_clusters(text)
+        parts: List[str] = []
+        remaining = clusters[:]
+        while len(remaining) > max_chars:
+            # Prefer the last phrase/sentence boundary before the visual
+            # limit. Never split a Burmese word merely because the line is
+            # close to max_chars; doing so creates broken phrases such as
+            # "အင်ဂျင်နီ" / "ယာတွေက...".
+            boundary_chars = "၊။!?…,:;—-"
+            before_limit = [
+                index for index in range(1, min(max_chars, len(remaining) - 1) + 1)
+                if remaining[index - 1].isspace() or remaining[index - 1] in boundary_chars
+            ]
+            cut = max(before_limit) if before_limit else max_chars
+            if not before_limit:
+                # If the next boundary is close enough, extend to it rather
+                # than cutting a word. A truly unbroken token falls back to
+                # a grapheme-safe hard cut as the only safe option.
+                for index in range(max_chars + 1, min(len(remaining) - 1, max_chars + 16) + 1):
+                    if remaining[index - 1].isspace() or remaining[index - 1] in boundary_chars:
+                        cut = index
+                        break
+            parts.append("".join(remaining[:cut]).strip())
+            remaining = remaining[cut:]
+        tail = "".join(remaining).strip()
+        if tail:
+            parts.append(tail)
+        start = float(segment.get("start", 0.0))
+        end = float(segment.get("end", start + 1.0))
+        total_weight = max(1, sum(len(grapheme_clusters(part)) for part in parts))
+        cursor = start
+        for index, part in enumerate(parts):
+            if index == len(parts) - 1:
+                part_end = end
+            else:
+                part_end = cursor + (end - start) * len(grapheme_clusters(part)) / total_weight
+            expanded.append({
+                **segment,
+                "text": part,
+                "start": round(cursor, 3),
+                "end": round(part_end, 3),
+            })
+            cursor = part_end
+    return expanded
+
+
+class SubtitleBurner:
+    def __init__(self, progress_callback: Optional[Callable[[str, float], None]] = None):
+        self.progress_callback = progress_callback
+
+    @staticmethod
+    def _font_family_from_file(font_path: Path) -> str:
+        try:
+            family = subprocess.check_output(
+                ["fc-scan", "--format=%{family}", str(font_path)],
+                text=True, stderr=subprocess.DEVNULL,
+            ).strip().split(",")[0].strip()
+            if family:
+                return family
+        except Exception:
+            pass
+        return font_path.stem
+
+    def _resolve_font(self, requested: str) -> (str, Optional[Path]):
+        """Return the exact ASS family and custom file selected by the user."""
+        requested = (requested or "Z10-Cartoon").strip()
+        custom_path = Path(str(settings_manager.get("custom_font_path", "")))
+        candidates = [custom_path] if custom_path.exists() else []
+        if CUSTOM_FONTS_DIR.exists():
+            candidates += sorted(CUSTOM_FONTS_DIR.glob("*.ttf"))
+            candidates += sorted(CUSTOM_FONTS_DIR.glob("*.otf"))
+        for font_path in candidates:
+            family = self._font_family_from_file(font_path)
+            if (family.casefold() == requested.casefold()
+                    or font_path.stem.casefold() == requested.casefold()):
+                return family, font_path
+        if requested.casefold() in {"myanmar text", "myanmartext"}:
+            requested = "Z10-Cartoon"
+        return requested, None
+
+    def _get_video_dimensions(self, video_path: Path) -> (int, int):
+        try:
+            cmd = [
+                "ffprobe", "-v", "error",
+                "-select_streams", "v:0",
+                "-show_entries", "stream=width,height",
+                "-of", "json",
+                str(video_path)
+            ]
+            res = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+            info = json.loads(res.stdout)
+            width = int(info["streams"][0]["width"])
+            height = int(info["streams"][0]["height"])
+            return width, height
+        except Exception:
+            return 1080, 1920
+
+    def generate_subtitles(
+        self,
+        segments: List[Dict[str, Any]],
+        output_dir: Path,
+        video_width: int,
+        video_height: int,
+        font_color: str = "#FFFFFF",
+        font_size_px: int = 70,
+        font_style: str = "Z10-Cartoon",
+        pos_x_pct: float = 50.0,
+        pos_y_pct: float = 82.0,
+        auto_blur: bool = False,
+        subtitle_animation: str = "fade",
+        output_resolution: Optional[str] = None
+    ) -> (Path, Path):
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+        ass_path = output_dir / "subtitles.ass"
+        srt_path = output_dir / "subtitles.srt"
+
+        resolution_key = str(output_resolution or "").lower()
+        resolution_sizes = {"1080p": 70, "tiktok1080": 70, "tiktok2k": 94, "2k": 94, "4k": 140, "tiktok4k": 140}
+        preset = resolution_sizes.get(resolution_key)
+        profile_longest_sides = {"1080p": 1920, "tiktok1080": 1920, "tiktok2k": 2560, "2k": 2560, "4k": 3840, "tiktok4k": 3840}
+        if preset is not None:
+            # Keep the same perceived subtitle scale after preserving a
+            # landscape/portrait source ratio instead of forcing a TikTok
+            # canvas. Scale from the profile's intended longest side.
+            base_longest_side = profile_longest_sides[resolution_key]
+            actual_longest_side = max(video_width, video_height)
+            preset = max(18, round(preset * actual_longest_side / base_longest_side))
+        if preset is None:
+            longest_side = max(video_width, video_height)
+            preset = 70 if longest_side <= 1920 else 94 if longest_side <= 2560 else 140
+        scaled_font_size = preset
+        outline_size = max(2, int(scaled_font_size * 0.12))
+
+        # ASS \pos() bypasses MarginL/MarginR, so clamp the requested center
+        # into a real safe area. Keep 5% on each horizontal side while also
+        # reserving enough room for the font outline at small resolutions.
+        safe_margin_x = max(int(video_width * 0.05), scaled_font_size + outline_size)
+        safe_margin_y = max(int(video_height * 0.06), scaled_font_size + outline_size * 2)
+        target_x = max(safe_margin_x, min(video_width - safe_margin_x, int(video_width * (pos_x_pct / 100.0))))
+        target_y = max(safe_margin_y, min(video_height - safe_margin_y, int(video_height * (pos_y_pct / 100.0))))
+
+        ass_color = hex_to_ass_color(font_color)
+        safe_font, _ = self._resolve_font(font_style)
+
+        # ASS header
+        ass_header = f"""[Script Info]
+ScriptType: v4.00+
+PlayResX: {video_width}
+PlayResY: {video_height}
+ScaledBorderAndShadow: yes
+
+[V4+ Styles]
+Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding
+Style: Default,{safe_font},{scaled_font_size},{ass_color},&H000000FF,&H00000000,&H90000000,-1,0,0,0,100,100,0,0,1,{outline_size},1,5,50,50,50,1
+
+[Events]
+Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text
+"""
+
+        ass_lines = [ass_header]
+        srt_lines = []
+
+        valid_segments = [s for s in segments if s.get("text", "").strip()]
+        safe_width = max(1, video_width - (safe_margin_x * 2))
+        safe_chars = max(8, int(safe_width / max(1, scaled_font_size * 0.95)))
+        valid_segments = split_sequential_subtitle_segments(valid_segments, max_chars=safe_chars)
+        animation = str(subtitle_animation or "fade").lower()
+        if animation not in {"none", "fade", "slide", "pop"}:
+            animation = "fade"
+        for idx, seg in enumerate(valid_segments):
+            start = float(seg.get("start", 0.0))
+            end = float(seg.get("end", start + 1.0))
+            text = normalize_myanmar_text(seg.get("text", "").strip())
+
+            ass_start = format_ass_timestamp(start)
+            ass_end = format_ass_timestamp(end)
+            # Keep each timed event sequential, but allow a phrase to occupy
+            # two balanced lines instead of forcing a single tiny line.
+            subtitle_text = wrap_subtitle_text(text, max_chars=safe_chars, max_lines=2)
+            clean_text = subtitle_text.replace("\n", "\\N")
+            
+            if animation == "fade":
+                tags = f"{{\\an5\\pos({target_x},{target_y})\\fad(180,180)}}"
+            elif animation == "slide":
+                tags = f"{{\\an5\\move({target_x - max(24, scaled_font_size // 2)},{target_y},{target_x},{target_y},0,180)}}"
+            elif animation == "pop":
+                tags = f"{{\\an5\\pos({target_x},{target_y})\\fscx90\\fscy90\\t(0,160,\\fscx100\\fscy100)}}"
+            else:
+                tags = f"{{\\an5\\pos({target_x},{target_y})}}"
+            ass_lines.append(f"Dialogue: 0,{ass_start},{ass_end},Default,,0,0,0,,{tags}{clean_text}\n")
+
+            srt_start = format_srt_timestamp(start)
+            srt_end = format_srt_timestamp(end)
+            srt_lines.append(f"{idx + 1}\n{srt_start} --> {srt_end}\n{subtitle_text}\n\n")
+
+        # Kaggle FFmpeg/libass is more reliable with an explicit UTF-8 BOM for
+        # Myanmar combining marks and font shaping.
+        with open(ass_path, "w", encoding="utf-8-sig") as f:
+            f.writelines(ass_lines)
+
+        with open(srt_path, "w", encoding="utf-8") as f:
+            f.writelines(srt_lines)
+
+        return ass_path, srt_path
+
+    def burn(
+        self,
+        video_path: Path,
+        segments: List[Dict[str, Any]],
+        output_path: Optional[Path] = None,
+        font_color: str = "#FFFFFF",
+        font_size_px: int = 70,
+        font_style: str = "Z10-Cartoon",
+        pos_x_pct: float = 50.0,
+        pos_y_pct: float = 82.0,
+        blur_band: Optional[Dict[str, float]] = None,
+        auto_blur: bool = False,
+        subtitle_animation: str = "fade",
+        output_resolution: Optional[str] = None
+    ) -> Path:
+        video_path = Path(video_path)
+        if not video_path.exists():
+            raise FileNotFoundError(f"Video file not found: {video_path}")
+
+        if output_path is None:
+            output_path = video_path.parent / "final_video.mp4"
+        else:
+            output_path = Path(output_path)
+
+        if self.progress_callback:
+            self.progress_callback("စာတန်းထိုးနေပါတယ်...", 15.0)
+
+        width, height = self._get_video_dimensions(video_path)
+        output_profile = str(output_resolution or "").lower()
+        is_tiktok = output_profile in {"tiktok1080", "tiktok2k", "tiktok4k"}
+        # The mixer has already applied the selected output resolution. Keep
+        # the resulting video's exact dimensions here so TikTok profiles do
+        # not force a 9:16 crop onto landscape or other source ratios.
+        render_width, render_height = width, height
+        ass_path, srt_path = self.generate_subtitles(
+            segments=segments,
+            output_dir=video_path.parent,
+            video_width=render_width,
+            video_height=render_height,
+            font_color=font_color,
+            font_size_px=font_size_px,
+            font_style=font_style,
+            pos_x_pct=pos_x_pct,
+            pos_y_pct=pos_y_pct,
+            auto_blur=auto_blur,
+            subtitle_animation=subtitle_animation,
+            output_resolution=output_resolution
+        )
+
+        encoder_name = get_active_encoder_name()
+        encoder_args = get_video_encoder_args(cq=18, crf=17)
+        tiktok_bitrate_args = {
+            "tiktok1080": ("12M", "16M", "24M"),
+            "tiktok2k": ("20M", "25M", "40M"),
+            "tiktok4k": ("35M", "45M", "60M"),
+        }.get(output_profile)
+        tiktok_encoder_args = [
+            "-b:v", tiktok_bitrate_args[0],
+            "-maxrate", tiktok_bitrate_args[1],
+            "-bufsize", tiktok_bitrate_args[2],
+            "-r", "30",
+            "-profile:v", "high",
+            "-pix_fmt", "yuv420p",
+            "-movflags", "+faststart",
+        ] if tiktok_bitrate_args else []
+
+        if self.progress_callback:
+            self.progress_callback(f"စာတန်းထိုးနေပါတယ်... (FFmpeg {encoder_name} rendering)", 50.0)
+
+        # Resolve the selected font explicitly; this avoids missing-font fallback on Kaggle.
+        fonts_dir_arg = ""
+        safe_font, selected_font_path = self._resolve_font(font_style)
+        try:
+            match_font = safe_font
+            font_file = subprocess.check_output(
+                ["fc-match", "-f", "%{file}", match_font],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            ).strip()
+            if font_file and Path(font_file).exists():
+                fonts_dir_arg = f":fontsdir='{Path(font_file).parent.as_posix()}'"
+        except Exception:
+            pass
+
+        # Always expose the custom directory when a custom font is selected;
+        # otherwise a system fc-match result can silently win.
+        if selected_font_path and CUSTOM_FONTS_DIR.exists():
+            # Escape for FFmpeg filter on Windows
+            clean_fonts_dir = str(CUSTOM_FONTS_DIR).replace('\\', '/').replace(':', '\\:')
+            fonts_dir_arg = f":fontsdir='{clean_fonts_dir}'"
+
+        # Use the absolute ASS path; relative subtitle paths can resolve to a
+        # stale file in queued Kaggle jobs and lose the selected font/style.
+        ass_filter_path = str(ass_path.resolve()).replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
+        sub_filter = f"ass='{ass_filter_path}'{fonts_dir_arg}"
+        if blur_band:
+            blur_top = max(0, min(render_height - 1, int(render_height * float(blur_band["top_percent"]) / 100.0)))
+            blur_bottom = max(blur_top + 1, min(render_height, int(render_height * float(blur_band["bottom_percent"]) / 100.0)))
+            blur_height = blur_bottom - blur_top
+            filter_graph = (
+                f"[0:v]split=2[base][blur_src];"
+                f"[blur_src]crop=iw:{blur_height}:0:{blur_top},boxblur=12:2[blurred];"
+                f"[base][blurred]overlay=0:{blur_top}:shortest=1[covered];"
+                f"[covered]{sub_filter}[vout]"
+            )
+            filter_args = ["-filter_complex", filter_graph, "-map", "[vout]", "-map", "0:a?", "-c:a", "aac", "-b:a", "192k", "-ar", "48000"]
+        else:
+            video_filter = sub_filter
+            filter_args = ["-vf", video_filter, "-c:a", "aac" if is_tiktok else "copy"]
+            if is_tiktok:
+                filter_args.extend(["-b:a", "192k", "-ar", "48000"])
+
+        cmd = [
+            "ffmpeg", "-y",
+            "-i", str(video_path.name),
+            *filter_args,
+            *encoder_args,
+            *tiktok_encoder_args,
+            str(output_path.name)
+        ]
+
+        result = subprocess.run(
+            cmd,
+            cwd=str(video_path.parent),
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True
+        )
+        (output_path.parent / "ffmpeg_subtitle_gpu.log").write_text(
+            result.stderr or "", encoding="utf-8", errors="replace"
+        )
+
+        if result.returncode != 0:
+            # If GPU encoding failed, retry once with CPU libx264 as safety fallback
+            if "h264_nvenc" in encoder_args or "h264_mf" in encoder_args:
+                print("[GPU WARNING] GPU subtitle burning failed; retrying with CPU libx264.")
+                fallback_cmd = [
+                    "ffmpeg", "-y",
+                    "-i", str(video_path.name),
+                    *filter_args,
+                    "-c:v", "libx264",
+                    "-preset", "fast",
+                    *( ["-crf", "18"] if not is_tiktok else ["-b:v", tiktok_bitrate_args[0], "-maxrate", tiktok_bitrate_args[1], "-bufsize", tiktok_bitrate_args[2], "-r", "30", "-profile:v", "high", "-level", tiktok_level, "-movflags", "+faststart"] ),
+                    "-pix_fmt", "yuv420p",
+                    str(output_path.name)
+                ]
+                fallback_res = subprocess.run(fallback_cmd, cwd=str(video_path.parent), stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+                (output_path.parent / "ffmpeg_subtitle_cpu.log").write_text(
+                    fallback_res.stderr or "", encoding="utf-8", errors="replace"
+                )
+                if fallback_res.returncode != 0:
+                    detail = (fallback_res.stderr or result.stderr or "").strip()[-1800:]
+                    raise RuntimeError(f"Subtitle rendering failed after CPU fallback: {detail}")
+            else:
+                detail = (result.stderr or "").strip()[-1800:]
+                raise RuntimeError(f"Video subtitle rendering failed: {detail}")
+
+        if not output_path.exists() or output_path.stat().st_size == 0:
+            raise RuntimeError("Subtitle burning produced empty or missing file.")
+
+        if self.progress_callback:
+            self.progress_callback("စာတန်းထိုးပြီးပါပြီ။", 100.0)
+
+        return output_path

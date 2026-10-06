@@ -1,0 +1,191 @@
+RECAP FREE — KAGGLE RUN CELLS v11 LOCAL AI
+=================================
+
+v12 concurrency + CUDA/NVENC preflight + font/animation/error UI:
+- Edge TTS: အများဆုံး ၃ ပုဒ် တစ်ပြိုင်တည်း
+- VoxCPM2: T4 GPU တစ်လုံးစီတွင် job တစ်ခု၊ GPU ၂လုံးရှိလျှင် job ၂ခု တစ်ပြိုင်တည်း
+- Slot ပြည့်ရင် အဲဒီ engine queue ထဲစောင့်မည်
+- Job တင်ချိန်မှာရွေးထားတဲ့ Voice Engine ကို snapshot သိမ်းမည်
+- Local AI: faster-whisper + NLLB-200 ကို cell ကနေ ကြို download လုပ်မည်
+- Transcription: Local faster-whisper ကို အမြဲသုံးမည်; Groq Speech-to-Text flow ဖြုတ်ထားသည်
+- Translation: Local AI ရွေးလျှင် Local NLLB; Cloud API ရွေးလျှင် Gemini API သာ သုံးမည်
+
+သတိ: Kaggle Notebook Settings တွင် Accelerator = GPU (T4 x2) နှင့် Internet = ON ဖြစ်ရမည်။ Cell 3 သည် CUDA ၂လုံး၊ VoxCPM model load နှင့် NVENC ကို အရင်စစ်ပြီး မအောင်မြင်လျှင် အကြောင်းရင်းကို တိတိကျကျပြပါမည်။
+
+CELL 1 — Production GitHub clone
+----------------------
+from pathlib import Path
+import shutil, subprocess, urllib.request, zipfile
+project = Path('/kaggle/working/recap-free')
+shutil.rmtree(project, ignore_errors=True)
+repo = 'https://github.com/surviveman78-commits/recap-free.git'
+try:
+    subprocess.run(['git', 'clone', '--depth', '1', repo, str(project)], check=True)
+    print('Project cloned with Git:', project)
+    print('Latest source:', subprocess.check_output(['git', '-C', str(project), 'log', '-1', '--oneline'], text=True).strip())
+except subprocess.CalledProcessError:
+    # GitHub Git transport may temporarily return 403 for a newly published repo.
+    # The public archive is equivalent and needs no token or Kaggle Secret.
+    archive = Path('/kaggle/working/recap-free.zip')
+    urllib.request.urlretrieve(repo.replace('.git', '/archive/refs/heads/main.zip'), archive)
+    with zipfile.ZipFile(archive) as zf:
+        zf.extractall('/kaggle/working')
+    extracted = Path('/kaggle/working/recap-free-main')
+    shutil.move(str(extracted), str(project))
+    print('Project downloaded from public GitHub archive:', project)
+
+CELL 2 — Install
+-----------------
+%cd /kaggle/working/recap-free
+!apt-get update -qq
+!apt-get install -y -qq ffmpeg fontconfig fonts-noto-core fonts-sil-padauk fonts-myanmar libsndfile1
+!fc-cache -f
+!pip install -q -r requirements-kaggle.txt
+import edge_tts, voxcpm, faster_whisper, transformers
+print('Edge TTS, VoxCPM2, Local Whisper, Local NLLB dependencies READY')
+
+# Tracked fonts are copied into data/custom_fonts automatically when the app starts.
+font_assets = Path('/kaggle/working/recap-free/assets/fonts')
+required_fonts = [font_assets / 'Z10-Cartoon.ttf', font_assets / 'MyanmarThuriya.ttf', font_assets / 'unicode_font_styles.zip']
+assert all(p.is_file() for p in required_fonts), f'Missing bundled font asset: {required_fonts}'
+print('Bundled fonts READY: Z10-Cartoon default, MyanmarThuriya priority, Unicode collection included')
+
+CELL 3 — Download all local models before UI
+----------------------------------------------
+%cd /kaggle/working/recap-free
+from huggingface_hub import snapshot_download
+import os
+models_root = '/kaggle/working/models'
+voxcpm_dir = f'{models_root}/VoxCPM2'
+whisper_dir = f'{models_root}/faster-whisper-large-v3'
+nllb_dir = f'{models_root}/nllb-200-distilled-1.3B'
+
+snapshot_download(repo_id='openbmb/VoxCPM2', local_dir=voxcpm_dir)
+snapshot_download(repo_id='Systran/faster-whisper-large-v3', local_dir=whisper_dir)
+snapshot_download(repo_id='facebook/nllb-200-distilled-1.3B', local_dir=nllb_dir)
+
+os.environ['VOXCPM_MODEL_ID'] = voxcpm_dir
+os.environ['RECAP_WHISPER_MODEL'] = whisper_dir
+os.environ['RECAP_NLLB_MODEL'] = nllb_dir
+os.environ['RECAP_LOCAL_ONLY'] = '1'
+os.environ['RECAP_WHISPER_DEVICE'] = 'cuda'
+os.environ['RECAP_WHISPER_DEVICE_INDEX'] = '0'
+os.environ['RECAP_NLLB_DEVICE'] = 'cuda:1'
+os.environ['RECAP_VOXCPM_CFG'] = '1.6'
+os.environ['RECAP_VOXCPM_STEPS'] = '20'
+os.environ['RECAP_VOXCPM_HIFI'] = '1'
+print('VoxCPM2 ready:', voxcpm_dir)
+print('Local Whisper ready:', whisper_dir)
+print('Local NLLB ready:', nllb_dir)
+
+# CUDA + NVENC preflight: run this before starting the server.
+import os, subprocess, torch
+print('PyTorch:', torch.__version__, 'CUDA build:', torch.version.cuda)
+print('torch.cuda.is_available():', torch.cuda.is_available())
+gpu_count = torch.cuda.device_count() if torch.cuda.is_available() else 0
+print('GPU count:', gpu_count)
+for i in range(gpu_count):
+    props = torch.cuda.get_device_properties(i)
+    print(f'GPU {i}: {props.name} | {props.total_memory / 1024**3:.1f} GB')
+assert gpu_count >= 2, 'CUDA GPU ၂လုံးမတွေ့ပါ။ Kaggle Settings > Accelerator ကို T4 x2 ပြောင်းပြီး runtime ပြန်စပါ။'
+for i in range(gpu_count):
+    torch.cuda.set_device(i)
+    x = torch.zeros(1, device=f'cuda:{i}')
+    assert x.is_cuda, f'cuda:{i} tensor test failed'
+print('CUDA tensor test: GPU 0/1 OK')
+nvenc_test = subprocess.run([
+    'ffmpeg', '-hide_banner', '-loglevel', 'error', '-y',
+    '-f', 'lavfi', '-i', 'color=c=black:s=256x256:d=0.10',
+    '-frames:v', '1', '-c:v', 'h264_nvenc', '-f', 'null', '-'
+], capture_output=True, text=True)
+if nvenc_test.returncode != 0:
+    print('WARNING: NVENC မရပါ။ Raw diagnostics:', nvenc_test.stderr.strip())
+    print('Video rendering သည် libx264 CPU fallback သုံးပါမည်။')
+else:
+    print('GPU/NVENC preflight OK — video rendering will prefer h264_nvenc.')
+
+CELL 4 — Start server
+----------------------
+%cd /kaggle/working/recap-free
+!python kaggle_foreground.py
+
+Cell 4 ကို running ထားပါ။ Output ထဲက trycloudflare URL ကို browser မှာဖွင့်ပါ။
+
+UI အသုံးပြုရန်
+--------------
+1. Settings ထဲမှာ AI Mode ကို **Local AI** ထားပါ။ Local mode မှာ API key မလိုပါ။
+2. Voice Engine ကို Edge TTS ထားပြီး video ၃ ပုဒ်အထိ တစ်ပြိုင်တည်းတင်နိုင်ပါမည်။
+3. Voice Engine ကို VoxCPM2 ထားလျှင် T4 GPU ၂လုံးအတွက် video ၂ပုဒ်အထိ တစ်ချိန်တည်းလုပ်ပါမည်။
+4. Slot ပြည့်လျှင် နောက် job သည် queue ထဲဝင်ပြီး slot လွတ်တာနဲ့ အလိုအလျောက်စပါမည်။
+5. Job တစ်ခုတင်ပြီးနောက် Voice Engine ပြောင်းလည်း အဲဒီ job က တင်ချိန်က engine ကိုပဲသုံးပါမည်။
+6. Font default သည် **Z10-Cartoon** ဖြစ်ပြီး **MyanmarThuriya** က ဒုတိယ priority ဖြစ်ပါသည်။ Settings ထဲတွင် Burmese live preview ဖြင့် font ရွေးပါ။
+7. Subtitle Animation တွင် Fade / Slide / Pop / None ရွေးနိုင်ပါသည်။ Default သည် Fade ဖြစ်ပါသည်။
+8. Subtitle size သည် 1080p = 70px, 2K = 94px, 4K = 140px ဖြစ်ပြီး ဘေးနှစ်ဘက် safe margin ၁၀% ထားပါသည်။
+9. NVENC မရပါက raw `libcuda.so.1` / FFmpeg diagnostic ကို Cell 3 output တွင်ပြပြီးမှ libx264 CPU fallback သုံးမည်။
+10. Cloud translation သုံးလိုပါက AI Mode ကို **Cloud API** ပြောင်းပြီး Gemini API key တစ်ခုတည်း ထည့်ပါ။ Speech-to-Text အတွက် API key မလိုပါ။
+
+UI မှာ Edge TTS ၃ jobs နဲ့ VoxCPM2 GPU ၂ jobs ကို သီးခြားတွက်ပါမည်။ Cloud API rate limit/CPU/RAM ကြောင့် လက်တွေ့အမြန်နှုန်း ကွာနိုင်ပါသည်။
+
+
+OPTIONAL PRECHECK — T4 နှစ်လုံးစစ်ရန်
+--------------------------------------
+import torch
+print('GPU count:', torch.cuda.device_count())
+for i in range(torch.cuda.device_count()):
+    print(i, torch.cuda.get_device_name(i), round(torch.cuda.get_device_properties(i).total_memory/1024**3, 2), 'GB')
+
+GPU count 2 မဟုတ်ရင် VoxCPM2 ၂ jobs မစမ်းပါနှင့်။
+
+
+RECOVERY CELL — URL DNS error / site can’t be reached
+------------------------------------------------------
+# ဒီ cell က dead tunnel/server ကိုရှင်းပြီး fresh URL အသစ်ပြန်ထုတ်ပါမယ်။
+import os, signal, subprocess, sys, time
+from pathlib import Path
+
+root = Path('/kaggle/working/recap-free')
+os.chdir(root)
+
+# Old server/tunnel processes ရှင်းရန်
+subprocess.run("pkill -f 'cloudflared.*127.0.0.1:8000'", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+subprocess.run("pkill -f 'python.*run.py'", shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+time.sleep(2)
+
+# Old logs မပေါင်းအောင် rename လုပ်ထားမယ်
+log_dir = root / 'logs'
+log_dir.mkdir(exist_ok=True)
+for name in ['cloudflared.log', 'server_foreground.log']:
+    p = log_dir / name
+    if p.exists():
+        p.rename(log_dir / f'{name}.old')
+
+# Supervisor ကို background မှာ run; ၎င်းက tunnel ပျက်တိုင်း URL အသစ်ပြန်ထုတ်မယ်
+log = (log_dir / 'supervisor_notebook.log').open('ab')
+proc = subprocess.Popen(
+    [sys.executable, 'kaggle_foreground.py'],
+    cwd=root, stdout=log, stderr=subprocess.STDOUT,
+    stdin=subprocess.DEVNULL, start_new_session=True,
+)
+print('Supervisor PID:', proc.pid)
+print('၅–၁၀ စက္ကန့်စောင့်ပြီး အောက်က Cell ကို run ပါ။')
+
+
+RECOVERY CELL 2 — URL အသစ်ဖတ်ရန်
+---------------------------------
+from pathlib import Path
+import re, time
+
+log_path = Path('/kaggle/working/recap-free/logs/supervisor_notebook.log')
+for _ in range(12):
+    if log_path.exists():
+        text = log_path.read_text(errors='ignore')
+        urls = re.findall(r'https://[a-zA-Z0-9-]+\.trycloudflare\.com', text)
+        if urls:
+            print('CURRENT PUBLIC URL:', urls[-1])
+            break
+    time.sleep(2)
+else:
+    print('URL မထွက်သေးပါ။ log ကိုစစ်ပါ:')
+    print(log_path.read_text(errors='ignore')[-3000:] if log_path.exists() else 'no log yet')
+
+အဟောင်း URL ကို မသုံးပါနှင့်။ `CURRENT PUBLIC URL` နောက်ဆုံးတစ်ခုကိုသာ browser မှာဖွင့်ပါ။
