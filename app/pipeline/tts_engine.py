@@ -269,13 +269,15 @@ class TTSEngine:
         voxcpm_ref_path: Optional[str] = None,
         voxcpm_ref_text: Optional[str] = None,
         voxcpm_device: Optional[str] = None,
-        sync_to_video: bool = False
+        sync_to_video: bool = False,
+        total_duration: Optional[float] = None
     ) -> Tuple[Path, List[Dict[str, Any]]]:
         """Generate narration audio.
 
-        ``sync_to_video`` is accepted for backward compatibility with callers
-        that use the older video-processing API. Audio/video synchronization is
-        handled by the video layer, so this flag is intentionally not used here.
+        ``sync_to_video`` and ``total_duration`` are accepted for backward
+        compatibility with callers that use the video-processing API. Audio/
+        video synchronization is handled by the video layer, so these values
+        are intentionally not used during TTS generation.
         """
         if engine != "voxcpm2" or os.getenv("RECAP_VOXCPM_CHILD") == "1":
             return self._generate_impl(segments, output_dir, engine, voice, voxcpm_ref_path, voxcpm_ref_text, voxcpm_device)
