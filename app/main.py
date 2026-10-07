@@ -17,7 +17,6 @@ from app.config import settings_manager, DATA_DIR, CUSTOM_VOICES_DIR, CUSTOM_FON
 from app.pipeline.orchestrator import PipelineOrchestrator, STAGES
 from app.pipeline.tts_engine import TTSEngine
 from app.pipeline.gpu_utils import get_active_encoder_name, check_gpu_nvenc_available, get_encoder_hardware_desc
-from app.pipeline.gpu_pool import cuda_pool
 from app.queue_manager import job_queue_manager, EDGE_MAX_CONCURRENT, VOXCPM_MAX_CONCURRENT
 from app.voice_clone_manager import create_job as create_voice_clone_job, get_job as get_voice_clone_job, list_jobs as list_voice_clone_jobs, VOICE_CLONE_DIR
 
@@ -82,6 +81,16 @@ class SettingsUpdateRequest(BaseModel):
     processing_mode: Optional[str] = None
     enable_4k_filter: Optional[bool] = None
     mirror_mode_7s: Optional[bool] = None
+
+
+def _resolve_keep_background(requested: Optional[bool] = None) -> bool:
+    """Voice-only output: original music/SFX are NOT added back.
+    Set environment variable RECAP_ALLOW_BACKGROUND=1 to allow the old behaviour."""
+    if os.getenv("RECAP_ALLOW_BACKGROUND", "0") == "1":
+        if requested is not None:
+            return bool(requested)
+        return bool(settings_manager.get("preserve_original_background", False))
+    return False
 
 
 class JobCreateRequest(BaseModel):
@@ -334,8 +343,7 @@ async def get_gpu_status():
     return {
         "gpu_accelerated": has_gpu,
         "encoder": get_active_encoder_name(),
-        "hardware": get_encoder_hardware_desc(),
-        "cuda_devices": cuda_pool.status(),
+        "hardware": get_encoder_hardware_desc()
     }
 
 
@@ -416,7 +424,7 @@ async def create_job(payload: JobCreateRequest):
         subtitle_pos_y=payload.subtitle_pos_y,
         subtitle_animation=payload.subtitle_animation,
         output_resolution=payload.output_resolution,
-        preserve_original_background=(bool(payload.preserve_original_background) if payload.preserve_original_background is not None else bool(settings_manager.get("preserve_original_background", False))),
+        preserve_original_background=_resolve_keep_background(payload.preserve_original_background),
         processing_mode=payload.processing_mode if payload.processing_mode in ("recap", "story", "dubbing") else "recap"
     )
 
@@ -474,11 +482,10 @@ async def create_job_upload(
     sub_enabled = True
     if subtitle_enabled is not None:
         sub_enabled = subtitle_enabled.lower() not in ("false", "0", "no")
-    keep_background = (
-        preserve_original_background.lower() not in ("false", "0", "no")
-        if preserve_original_background is not None
-        else bool(settings_manager.get("preserve_original_background", False))
-    )
+    requested_background = None
+    if preserve_original_background is not None:
+        requested_background = preserve_original_background.lower() not in ("false", "0", "no")
+    keep_background = _resolve_keep_background(requested_background)
 
     # Stash uploaded file in dedicated uploads folder
     upload_dir = DATA_DIR / "uploads"
