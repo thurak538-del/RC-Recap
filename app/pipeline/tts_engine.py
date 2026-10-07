@@ -73,7 +73,7 @@ class TTSEngine:
             ]
 
         language_labels = {
-            "my-MM": "Burmese (မြန်မာ)",
+            "my-MM": "Burmese (á€™á€¼á€”á€ºá€™á€¬)",
             "en-US": "English (United States)",
             "en-GB": "English (United Kingdom)",
             "th-TH": "Thai (Thailand)",
@@ -268,9 +268,15 @@ class TTSEngine:
         voice: str = "my-MM-ThihaNeural",
         voxcpm_ref_path: Optional[str] = None,
         voxcpm_ref_text: Optional[str] = None,
-        voxcpm_device: Optional[str] = None
+        voxcpm_device: Optional[str] = None,
+        sync_to_video: bool = False
     ) -> Tuple[Path, List[Dict[str, Any]]]:
-        """Run VoxCPM in a separate process; Edge TTS stays lightweight in-process."""
+        """Generate narration audio.
+
+        ``sync_to_video`` is accepted for backward compatibility with callers
+        that use the older video-processing API. Audio/video synchronization is
+        handled by the video layer, so this flag is intentionally not used here.
+        """
         if engine != "voxcpm2" or os.getenv("RECAP_VOXCPM_CHILD") == "1":
             return self._generate_impl(segments, output_dir, engine, voice, voxcpm_ref_path, voxcpm_ref_text, voxcpm_device)
 
@@ -342,7 +348,7 @@ class TTSEngine:
 
             pct = 10.0 + (idx / total_segments) * 75.0
             if self.progress_callback:
-                self.progress_callback(f"အသံဖိုင် ဖန်တီးနေပါတယ်... ({idx + 1}/{total_segments})", pct)
+                self.progress_callback(f"á€¡á€žá€¶á€–á€­á€¯á€„á€º á€–á€”á€ºá€á€®á€¸á€”á€±á€•á€«á€á€šá€º... ({idx + 1}/{total_segments})", pct)
 
             if engine == "voxcpm2":
                 self._generate_voxcpm_segment(text, ref_path, voxcpm_ref_text, seg_file, voxcpm_device)
@@ -361,7 +367,7 @@ class TTSEngine:
             })
 
         if self.progress_callback:
-            self.progress_callback("ဇာတ်လမ်းပြော အသံဖိုင် စီစဉ်ပေါင်းစပ်နေပါတယ်...", 90.0)
+            self.progress_callback("á€‡á€¬á€á€ºá€œá€™á€ºá€¸á€•á€¼á€±á€¬ á€¡á€žá€¶á€–á€­á€¯á€„á€º á€…á€®á€…á€‰á€ºá€•á€±á€«á€„á€ºá€¸á€…á€•á€ºá€”á€±á€•á€«á€á€šá€º...", 90.0)
 
         # Step 2: Assemble into ONE continuous, seamless narration track
         # Trim leading/trailing silences and use tight 0.06s cadence so voice never pauses or halts
