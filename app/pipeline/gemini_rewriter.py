@@ -1,4 +1,5 @@
 import json
+import os
 import re
 import time
 from pathlib import Path
@@ -107,17 +108,6 @@ class GeminiRewriter:
             return None
         if not all(item in valid_ids for item in source_ids):
             return None
-        # Recap only: the source opening may already be a deliberate hook. In
-        # that case adding another generated hook would play two hooks back to
-        # back. Story keeps its existing hook behavior because its opening is
-        # authored as part of the narrative rewrite.
-        if active_mode == "recap":
-            opening_ids = {
-                seg.get("id") for seg in source_segments
-                if float(seg.get("start", 0.0) or 0.0) < 3.5
-            }
-            if source_ids and set(source_ids).issubset(opening_ids):
-                return None
         # Keep the opening hook short enough to speak in roughly three
         # seconds; this is a guardrail in addition to the model instruction.
         if len(text) > 100 or len(source_ids) > 4:
@@ -132,6 +122,72 @@ class GeminiRewriter:
             "hook_type": str(raw.get("hook_type") or "conflict"),
             "confidence": float(raw.get("confidence") or 0.0),
         }
+
+    @staticmethod
+    def _dub_budgets(source_segments: List[Dict[str, Any]]) -> Dict[Any, int]:
+        """DUB mode: max Burmese characters that can be spoken inside each segment's
+        time window (the window may borrow a little of the silent gap before the next one).
+        Tune with env RECAP_DUB_CHARS_PER_SEC (default 13)."""
+        cps = float(os.getenv("RECAP_DUB_CHARS_PER_SEC", "13"))
+        budgets: Dict[Any, int] = {}
+        for i, seg in enumerate(source_segments):
+            start = float(seg.get("start", 0.0))
+            end = float(seg.get("end", start))
+            slot = max(end - start, 0.3)
+            if i + 1 < len(source_segments):
+                gap_room = float(source_segments[i + 1].get("start", end)) - start - 0.1
+            else:
+                gap_room = slot + 1.0
+            room = min(max(slot, gap_room), slot + 1.5)
+            budgets[seg.get("id")] = max(8, int(room * cps))
+        return budgets
+
+    def _shorten_overlong(
+        self,
+        segments: List[Dict[str, Any]],
+        budgets: Dict[Any, int],
+        lang_name: str,
+        model_order: List[str],
+        rounds: int = 2,
+        tolerance: float = 1.15,
+    ) -> List[Dict[str, Any]]:
+        """DUB mode: ask the model to shorten only the lines that cannot be spoken in time."""
+        current = {seg["id"]: seg["text"] for seg in segments}
+        for round_no in range(1, rounds + 1):
+            over = [
+                {"id": sid, "text": text, "max_chars": budgets.get(sid, 9999)}
+                for sid, text in current.items()
+                if len(text) > budgets.get(sid, 9999) * tolerance
+            ]
+            if not over:
+                break
+            if self.progress_callback:
+                self.progress_callback(
+                    f"Dubbing အချိန်နဲ့ကိုက်အောင် စာကြောင်း {len(over)} ခုကို တိုနေပါသည် (round {round_no})...", 70.0
+                )
+            prompt = f"""
+Shorten each {lang_name} dubbing line so it can be spoken within its time limit.
+Keep the same core meaning, speaker emotion, intensity and names. Natural spoken language.
+Do not add new information. Do not merge or reorder lines.
+Each "text" MUST be at most "max_chars" Unicode characters. Count carefully and be shorter if unsure.
+Return ONLY JSON: {{"segments": [{{"id": 0, "text": "shortened line"}}]}}
+
+INPUT:
+{json.dumps(over, ensure_ascii=False)}
+"""
+            try:
+                parsed = self._extract_json(self._generate(prompt, model_order))
+            except Exception as exc:
+                print(f"[DUB TEXT] shorten round {round_no} failed: {exc}", flush=True)
+                break
+            for item in parsed.get("segments", []) or []:
+                sid = item.get("id")
+                new_text = normalize_myanmar_text(str(item.get("text", "")).strip())
+                if sid in current and new_text and len(new_text) < len(current[sid]):
+                    current[sid] = new_text
+        still_over = sum(1 for sid, text in current.items() if len(text) > budgets.get(sid, 9999) * tolerance)
+        print(f"[DUB TEXT] {len(current)} lines | still longer than time window: {still_over}", flush=True)
+        return [{**seg, "text": current[seg["id"]]} for seg in segments]
 
     def _generate(self, prompt: str, model_candidates: List[str]) -> str:
         last_err = None
@@ -209,12 +265,16 @@ source duration when the source is long (for example, a 9-minute video should
 normally become about 5–6 minutes). Preserve the story's key meaning and suspense.
 The renderer will adjust the video to the final TTS duration.
 """
-        elif source_duration > 0 and active_mode == "dubbing":
-            duration_rule = f"""
-DUBBING TIMING RULE:
-The source dialogue is approximately {source_duration:.1f} seconds long. Keep the
-translation close to the original timing. Do not intentionally expand the dialogue,
-repeat content, or pad it to reach one minute.
+        elif active_mode == "dubbing":
+            duration_rule = """
+DUBBING TIMING RULE (HIGHEST PRIORITY in Dubbing mode):
+Every source segment has a "max_chars" value: the maximum number of Burmese characters
+that can be spoken inside that segment's time window while the speaker is talking on screen.
+* The translated text of each segment MUST NOT be longer than its max_chars.
+* Use short, natural spoken Burmese. Drop filler words, repeated words and minor details.
+* If the full literal meaning does not fit, keep the main meaning, emotion and names,
+  and shorten the rest. Timing overrides the "do not remove details" rules below.
+* Never expand, pad, repeat or add narrator-style commentary.
 """
         elif source_duration > 0:
             duration_rule = f"""
@@ -228,53 +288,43 @@ and do not repeat a sentence, event, or conclusion to increase the duration.
 Keep the original segment ids and timestamps; put the naturally expanded wording
 into the corresponding segment texts.
 """
+        dub_budgets = self._dub_budgets(source_segments) if active_mode == "dubbing" else {}
+        prompt_segments = (
+            [{**seg, "max_chars": dub_budgets.get(seg.get("id"), 9999)} for seg in source_segments]
+            if dub_budgets else source_segments
+        )
         if self.progress_callback:
             self.progress_callback("Transcript အပြည့်ကို ဖတ်ပြီး video အမျိုးအစား ခွဲနေပါသည်...", 10.0)
 
         story_mode_prompt = """
-You are a professional Burmese movie, drama, and anime recap storyteller.
+You are a professional movie/drama/anime recap writer.
 
-Transform a transcript that may contain conversations between two or more movie
-characters into a clear, engaging Burmese story narration. This is a narrator
-recap, not a line-by-line dubbing script.
+Transform the provided video into an engaging Burmese storytelling recap.
 
-MULTI-CHARACTER STORY RULES:
-- First understand each conversation in its scene context: who is speaking,
-  what they want, what they know, what they hide, and how the exchange changes
-  the story.
-- Do not translate every dialogue line separately. Convert dialogue into smooth
-  narrator sentences that explain the important meaning and consequence.
-- Keep character identities and relationships clear. Use a name or a short
-  description when the audience could otherwise confuse two characters.
-- Preserve important arguments, promises, threats, discoveries, decisions,
-  betrayals, emotional changes, and information revealed through dialogue.
-- Never invent a speaker, motive, relationship, event, or twist that is not
-  supported by the transcript.
-- Do not output speaker labels, quotation-heavy dialogue, bullet points, scene
-  headings, or chapter labels. Write one continuous story flow for TTS.
+Requirements:
+- Write in natural conversational Burmese.
+- Tell the story naturally, not scene-by-scene summarization.
+- Make the audience feel like they are experiencing the events together with the characters.
+- Focus on tension, emotions, danger, clever decisions, mistakes, twists, and unexpected moments.
+- Maintain strong viewer curiosity throughout the story.
+- Use natural storytelling transitions.
+- Avoid repetitive phrases and AI-sounding narration.
+- Keep the pacing smooth and engaging.
+- Build suspense naturally before important reveals.
+- Make every paragraph give viewers a reason to continue watching.
 
-STORY COVERAGE:
-- This is a complete movie recap, not a shallow short summary.
-- Follow the main chain of cause and effect from setup to consequence.
-- Include important visual actions as well as important conversations.
-- Remove only repeated greetings, filler reactions, long pauses, and duplicate
-  information that do not change the plot.
-- Do not repeat an event merely to make the narration longer.
+Hook Style:
+- Do not use generic hooks such as “ဒါပေမယ့် သူ မသိသေးတာက...” or “နောက်ထပ် ဖြစ်လာမယ့်အရာက...”.
+- Create curiosity from the actual situation. Hooks may show that a character misunderstands danger, that a decision changes everything, that a hidden detail matters, or that expectations and reality diverge.
 
-WRITING STYLE:
-- Natural spoken Burmese with short, easy-to-hear sentences.
-- Explain the scene like a skilled storyteller speaking to a friend.
-- Focus on tension, emotion, danger, clever decisions, mistakes, reversals,
-  and consequences without exaggerated clickbait.
-- Use natural transitions so the audience understands why the next event occurs.
-- Build curiosity from the actual situation before an important reveal.
-- Avoid robotic phrasing and repetitive openings such as “ဒါပေမယ့် သူ မသိသေးတာက...”
-  or “နောက်ထပ် ဖြစ်လာမယ့်အရာက...”.
+Writing Style:
+- Natural spoken Burmese; short and clear sentences.
+- Emotional but believable, with no exaggerated clickbait.
+- No bullet points, chapter labels, or scene-by-scene headings.
+- Use one continuous storytelling flow that sounds like a human storyteller, not an AI summary.
 
-OUTPUT:
-Generate a complete Burmese movie-story recap optimized for YouTube, TikTok,
-and Facebook narration. Return only the requested JSON structure; the final
-spoken text must remain a continuous narrator script.
+Output:
+Generate a complete Burmese recap script optimized for YouTube, TikTok, and Facebook storytelling videos with strong retention and natural audience engagement.
 """
         educational_rewrite_prompt = """
 You are an expert Burmese educational storyteller and translator.
@@ -372,15 +422,12 @@ SOURCE FULL TRANSCRIPT:
 {source_text}
 
 SOURCE TIMED SEGMENTS:
-{json.dumps(source_segments, ensure_ascii=False, indent=2)}
+{json.dumps(prompt_segments, ensure_ascii=False, indent=2)}
 
 HOOK RULES (Recap and Story only):
 * First inspect the full transcript and choose the strongest source-supported conflict,
   danger, mystery, unexpected change, or turning point.
 * Write one very short natural Burmese opening hook from that event, without inventing facts.
-* Recap mode only: if the source video already begins with a clear hook or
-  attention-grabbing opening, return use_hook=false so the original hook is not
-  followed by a duplicate generated hook. Do not apply this special rule to Story mode.
 * Do not reveal the complete ending, identity reveal, or full twist.
 * The hook is a preview, not a new event and not a summary of the whole video.
 * Link it to the exact source segment ids used.
@@ -425,6 +472,8 @@ VALIDATION_ERROR={reason}
             raise RuntimeError(f"Translation validation failed: {reason}")
 
         processed_segments = self._normalise_segments(source_segments, translated)
+        if dub_budgets:
+            processed_segments = self._shorten_overlong(processed_segments, dub_budgets, lang_name, model_order)
         hook = self._normalise_hook(parsed, source_segments, active_mode)
         if hook:
             processed_segments = [hook, *processed_segments]
