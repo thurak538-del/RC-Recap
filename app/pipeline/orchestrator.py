@@ -94,6 +94,31 @@ class PipelineOrchestrator:
             reported = 0.0
         return reported if reported > 0 else float(fallback or 0.0)
 
+    @staticmethod
+    def _attach_original_timing(processed: list, original: list) -> list:
+        """DUB mode: every processed (translated) segment must carry the ORIGINAL
+        video start/end so the voice can be placed exactly when the person speaks."""
+        by_id = {}
+        for src in original or []:
+            if src.get("id") is not None:
+                by_id[src["id"]] = src
+        out, missing = [], 0
+        for i, seg in enumerate(processed or []):
+            seg = dict(seg)
+            if seg.get("start") is None or seg.get("end") is None:
+                src = by_id.get(seg.get("id")) if seg.get("id") is not None else None
+                if src is None and len(processed) == len(original or []):
+                    src = original[i]
+                if src is not None:
+                    seg["start"] = src.get("start")
+                    seg["end"] = src.get("end")
+                else:
+                    missing += 1
+            out.append(seg)
+        if missing:
+            print(f"[DUB SYNC] WARNING: {missing} segment(s) have no original timing; they will follow the previous sentence.", flush=True)
+        return out
+
     def run(
         self,
         video_url: Optional[str],
@@ -134,279 +159,4 @@ class PipelineOrchestrator:
             if uploaded_video_path and Path(uploaded_video_path).exists():
                 video_file = self.job_dir / f"downloaded_video{Path(uploaded_video_path).suffix}"
                 shutil.copy2(str(uploaded_video_path), str(video_file))
-                self._notify(stage_1, 1, "တင်ထားသော ဗီဒီယိုဖိုင်ကို အသုံးပြုနေပါသည်...", 100.0)
-            elif video_url:
-                downloader = VideoDownloader(
-                    self.job_dir,
-                    progress_callback=lambda msg, pct: self._notify(stage_1, 1, msg, pct)
-                )
-                video_file = downloader.download(video_url)
-            else:
-                raise ValueError("ဗီဒီယို Link သို့မဟုတ် Video ဖိုင် ထည့်သွင်းပေးပါ။")
-
-            self.artifacts["downloaded_video"] = video_file.name
-            source_duration = self._get_media_duration(video_file)
-
-            # ----------------------------------------------------
-            # STAGE 2: အသံဖိုင် ထုတ်ယူနေပါတယ်...
-            # ----------------------------------------------------
-            stage_2 = STAGES[1]
-            self._notify(stage_2, 2, "FFmpeg ဖြင့် အသံဖိုင် ထုတ်ယူနေပါသည်...", 10.0)
-            extractor = AudioExtractor(
-                progress_callback=lambda msg, pct: self._notify(stage_2, 2, msg, pct)
-            )
-            original_audio = extractor.extract(video_file)
-            self.artifacts["original_audio"] = original_audio.name
-            background_audio = None
-            # Story is narration-only. Recap and Dubbing remove the original
-            # human speech but keep the original music/effects bed underneath TTS.
-            keep_background = str(processing_mode).lower() != "story"
-            # IMPORTANT: do not run Demucs here. Whisper must transcribe the
-            # complete extracted audio while the original voice is still present.
-
-            # ----------------------------------------------------
-            # STAGE 3: အသံကို စာသားအဖြစ် ပြောင်းနေပါတယ်... (Local Whisper STT)
-            # ----------------------------------------------------
-            stage_3 = STAGES[2]
-            self._notify(stage_3, 3, "Local Whisper ဖြင့် အသံကို စာသားပြောင်းနေပါသည်...", 15.0)
-            transcriber = LocalWhisperTranscriber(
-                progress_callback=lambda msg, pct: self._notify(stage_3, 3, msg, pct)
-            )
-            groq_res = transcriber.transcribe(original_audio, self.job_dir)
-            transcript_duration = self._get_transcript_duration(groq_res, source_duration)
-            self.artifacts["transcript_json"] = "transcript.json"
-            self.artifacts["transcript_txt"] = "transcript.txt"
-
-            self._notify(
-                stage_3, 3,
-                f"စာသားပြောင်းလဲခြင်း ပြီးပါပြီ ({len(groq_res['segments'])} segments)",
-                100.0,
-                data={
-                    "transcript_text": groq_res["text"],
-                    "transcript_segments": groq_res["segments"],
-                    "ai_mode": ai_mode,
-                }
-            )
-
-            # ----------------------------------------------------
-            # STAGE 4: စာသားကို ဘာသာပြန် / ပြန်လည်ရေးသားနေပါတယ်... (Gemini)
-            # ----------------------------------------------------
-            stage_4 = STAGES[3]
-            story_requires_gemini = str(processing_mode).lower() == "story"
-            if story_requires_gemini and not gemini_api_key:
-                raise ValueError("Story Mode အတွက် Gemini API Key လိုအပ်ပါသည်။ Story prompt ကို Gemini ဖြင့်သာ အသုံးပြုနိုင်ပါသည်။")
-            if ai_mode == "local" and not story_requires_gemini:
-                self._notify(stage_4, 4, "Local NLLB ဖြင့် မူရင်းအဓိပ္ပာယ်မပျက် ဘာသာပြန်နေပါသည်...", 15.0)
-                rewriter = LocalNLLBTranslator(
-                    progress_callback=lambda msg, pct: self._notify(stage_4, 4, msg, pct)
-                )
-                gemini_res = rewriter.translate(groq_res, self.job_dir, target_language=target_language)
-            else:
-                self._notify(stage_4, 4, "Gemini API ဖြင့် မူရင်းအဓိပ္ပာယ်မပျက် ဘာသာပြန်နေပါသည်...", 15.0)
-                rewriter = GeminiRewriter(
-                    api_key=gemini_api_key,
-                    progress_callback=lambda msg, pct: self._notify(stage_4, 4, msg, pct)
-                )
-                gemini_res = rewriter.process(
-                    groq_result=groq_res,
-                    output_dir=self.job_dir,
-                    mode=gemini_mode,
-                    target_language=target_language,
-                    source_duration=transcript_duration,
-                    processing_mode=processing_mode,
-                )
-            tts_segments = []
-            if str(target_language or "").lower().startswith("my"):
-                # Burmese TTS voices should receive Myanmar numerals. ASCII
-                # digits in translated text are otherwise pronounced in an
-                # English-style way by Edge TTS and VoxCPM.
-                display_segments = []
-                for segment in gemini_res.get("segments", []):
-                    display_text = normalize_burmese_digits(segment.get("text", ""))
-                    display_segments.append({**segment, "text": display_text, "display_text": display_text, "tts_text": prepare_burmese_tts_text(display_text)})
-                gemini_res["segments"] = display_segments
-                gemini_res["full_text"] = normalize_burmese_digits(gemini_res.get("full_text", ""))
-                tts_segments = display_segments
-                processed_txt = self.job_dir / "processed_transcript.txt"
-                if processed_txt.exists():
-                    processed_txt.write_text(gemini_res["full_text"].strip() + "\n", encoding="utf-8")
-                processed_json = self.job_dir / "processed_transcript.json"
-                if processed_json.exists():
-                    try:
-                        metadata = json.loads(processed_json.read_text(encoding="utf-8"))
-                        metadata["full_text"] = gemini_res["full_text"]
-                        metadata["segments"] = gemini_res["segments"]
-                        processed_json.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
-                    except (OSError, ValueError, TypeError):
-                        pass
-            self.artifacts["processed_transcript_txt"] = "processed_transcript.txt"
-            self.artifacts["processed_transcript_json"] = "processed_transcript.json"
-
-            self._notify(
-                stage_4, 4,
-                "ဇာတ်လမ်းပြောစာသား ပြင်ဆင်ခြင်း ပြီးပါပြီ။",
-                100.0,
-                data={
-                    "processed_text": gemini_res["full_text"],
-                    "processed_segments": gemini_res["segments"]
-                }
-            )
-
-            # ----------------------------------------------------
-            # STAGE 5: အသံဖိုင် ဖန်တီးနေပါတယ်... (Continuous Narration)
-            # ----------------------------------------------------
-            stage_5 = STAGES[4]
-            self._notify(stage_5, 5, f"ဇာတ်လမ်းပြော အသံဖိုင် ဖန်တီးနေပါသည် ({voice_engine})...", 10.0)
-            tts_engine = TTSEngine(
-                progress_callback=lambda msg, pct: self._notify(stage_5, 5, msg, pct)
-            )
-            if not tts_segments:
-                tts_segments = [{**segment, "display_text": segment.get("text", ""), "tts_text": segment.get("text", "")} for segment in gemini_res["segments"]]
-            tts_audio, synced_segments = tts_engine.generate(
-                segments=tts_segments,
-                output_dir=self.job_dir,
-                engine=voice_engine,
-                voice=edge_tts_voice,
-                voxcpm_ref_path=voxcpm_voice_path,
-                voxcpm_ref_text=voxcpm_ref_text,
-                voxcpm_device=voxcpm_device
-            )
-            self.artifacts["tts_audio"] = tts_audio.name
-
-            # ----------------------------------------------------
-            # STAGE 6: Music/SFX ကို voice မှ ခွဲထုတ်နေပါတယ်...
-            # ----------------------------------------------------
-            stage_6 = STAGES[5]
-            if keep_background:
-                self._notify(stage_6, 6, "မူရင်း voice ကို music/SFX မှ ခွဲထုတ်နေပါသည်...", 10.0)
-                separator = VocalSeparator(
-                    progress_callback=lambda msg, pct: self._notify(stage_6, 6, msg, 10.0 + pct * 0.35)
-                )
-                # Demucs receives the original stereo/high-quality mix only
-                # after Whisper and TTS have finished using the full vocal mix.
-                source_mix_audio = separator.extract_source_audio(video_file, self.job_dir / "original_mix_audio.wav")
-                self.artifacts["original_mix_audio"] = source_mix_audio.name
-                background_audio = separator.separate_background(source_mix_audio, self.job_dir)
-                self.artifacts["background_audio"] = str(background_audio.relative_to(self.job_dir))
-
-            # ----------------------------------------------------
-            # STAGE 6: ဗီဒီယိုနဲ့ အသံ ပေါင်းနေပါတယ်... (Speed Matching via setpts)
-            # ----------------------------------------------------
-            self._notify(stage_6, 6, "Video + Music/SFX ကို TTS ကြာချိန်နှင့် ကိုက်ညီအောင် ညှိနေပါသည်...", 50.0)
-            mixer = AudioMixer(
-                progress_callback=lambda msg, pct: self._notify(stage_6, 6, msg, pct)
-            )
-            dubbed_video = mixer.mix(
-                video_file,
-                tts_audio,
-                resolution=output_resolution,
-                background_audio_path=background_audio,
-                enable_4k_filter=bool(enable_4k_filter),
-                mirror_mode_7s=bool(mirror_mode_7s),
-                sync_segments=synced_segments,
-            )
-            self.artifacts["dubbed_video"] = dubbed_video.name
-
-            # ----------------------------------------------------
-            # STAGE 7: စာတန်းထိုးနေပါတယ်... (Custom pos(x,y) burning or export)
-            # ----------------------------------------------------
-            stage_7 = STAGES[6]
-            burner = SubtitleBurner(
-                progress_callback=lambda msg, pct: self._notify(stage_7, 7, msg, pct)
-            )
-            blur_band = None
-            if enable_subtitles and auto_blur_subtitles:
-                self._notify(stage_7, 7, "မူရင်းစာတန်းနေရာကို Gemini Vision ဖြင့် frame ၃ ခုစစ်နေပါသည်...", 5.0)
-                detector = GeminiSubtitleBandDetector(
-                    api_key=gemini_api_key,
-                    progress_callback=lambda msg, pct: self._notify(stage_7, 7, msg, pct),
-                )
-                detection = detector.detect(video_file, self.job_dir)
-                blur_band = padded_band(detection, auto_blur_padding_pct)
-                if blur_band:
-                    pos_x_pct = 50.0
-                    pos_y_pct = (blur_band["top_percent"] + blur_band["bottom_percent"]) / 2.0
-                    self._notify(stage_7, 7, "မူရင်းစာတန်း band ကို အတိအကျဖုံးပြီး ဘာသာပြန်စာတန်းထည့်နေပါသည်...", 55.0)
-                else:
-                    self._notify(stage_7, 7, "မူရင်း hardcoded စာတန်းမတွေ့ပါ။ Blur မထည့်ဘဲ ဆက်လုပ်နေပါသည်...", 55.0)
-            if enable_subtitles:
-                self._notify(stage_7, 7, "စာတန်းထိုး ထည့်သွင်းနေပါသည်...", 15.0)
-                final_video = burner.burn(
-                    video_path=dubbed_video,
-                    segments=synced_segments,
-                    font_color=font_color,
-                    font_size_px=font_size_px,
-                    font_style=font_style,
-                    pos_x_pct=pos_x_pct,
-                    pos_y_pct=pos_y_pct,
-                    subtitle_animation=subtitle_animation,
-                    blur_band=blur_band,
-                    auto_blur=bool(blur_band),
-                    output_resolution=output_resolution
-                )
-            else:
-                self._notify(stage_7, 7, "စာတန်းထိုးဖိုင် (SRT) ထုတ်ယူနေပါသည်...", 50.0)
-                width, height = burner._get_video_dimensions(dubbed_video)
-                burner.generate_subtitles(
-                    segments=synced_segments,
-                    output_dir=self.job_dir,
-                    video_width=width,
-                    video_height=height,
-                    font_color=font_color,
-                    font_size_px=font_size_px,
-                    font_style=font_style,
-                    pos_x_pct=pos_x_pct,
-                    pos_y_pct=pos_y_pct,
-                    subtitle_animation=subtitle_animation,
-                    output_resolution=output_resolution
-                )
-                final_video = self.job_dir / "final_video.mp4"
-                shutil.copy2(dubbed_video, final_video)
-
-            self.artifacts["final_video"] = final_video.name
-            self.artifacts["subtitles_ass"] = "subtitles.ass"
-            self.artifacts["subtitles_srt"] = "subtitles.srt"
-
-            # ----------------------------------------------------
-            # STAGE 8: ပြီးပါပြီ ✓ (Complete)
-            # ----------------------------------------------------
-            stage_8 = STAGES[7]
-            self.status = "completed"
-            final_dur = self._get_media_duration(final_video)
-            mins = int(final_dur // 60)
-            secs = int(final_dur % 60)
-            formatted_duration = f"{mins:02d}:{secs:02d}"
-
-            summary_data = {
-                "job_id": self.job_id,
-                "artifacts": self.artifacts,
-                "groq_text": groq_res["text"],
-                "processed_text": gemini_res["full_text"],
-                "segments_count": len(synced_segments),
-                "final_duration_seconds": round(final_dur, 2),
-                "final_duration_formatted": formatted_duration,
-                "final_video_url": f"/api/jobs/{self.job_id}/files/final_video.mp4"
-            }
-
-            with open(self.job_dir / "job_summary.json", "w", encoding="utf-8") as f:
-                json.dump(summary_data, f, indent=2, ensure_ascii=False)
-
-            self._notify(stage_8, 8, "ဗီဒီယို လုပ်ငန်းစဉ် အောင်မြင်စွာ ပြီးဆုံးပါပြီ။", 100.0, data=summary_data)
-            return summary_data
-
-        except Exception as e:
-            self.status = "failed"
-            err_msg = str(e)
-            if any(token in err_msg for token in ("h264_nvenc", "libcuda.so", "Error while filtering", "Nothing was written", "FFmpeg")):
-                sanitized_msg = (
-                    "ဗီဒီယို rendering မအောင်မြင်ပါ။ GPU မရသဖြင့် CPU fallback ကို စမ်းပြီးပါပြီ။\n"
-                    "FFmpeg detail:\n" + err_msg[-1800:]
-                )
-            else:
-                sanitized_msg = err_msg
-            sanitized_msg = sanitized_msg.replace(groq_api_key, "***") if groq_api_key else sanitized_msg
-            if gemini_api_key:
-                sanitized_msg = sanitized_msg.replace(gemini_api_key, "***")
-            print(f"Pipeline job {self.job_id} failed: {sanitized_msg}")
-            self._notify("မအောင်မြင်ပါ", -1, f"အမှားဖြစ်ပေါ်ပါသည်: {sanitized_msg}", 0.0, data={"error": sanitized_msg})
-            raise RuntimeError(sanitized_msg)
+                self._notify(stage_1, 1, "တင်ထားသော ဗီဒီယိုဖိုင်ကို အသုံးပြုနေပါသည်..."
