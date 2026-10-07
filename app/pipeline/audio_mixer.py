@@ -36,8 +36,6 @@ class AudioMixer:
         if speed <= 0:
             return "atempo=1.0"
         filters = []
-        # FFmpeg's atempo accepts 0.5..2.0 per filter. Chain filters for
-        # longer/shorter stretches instead of silently truncating the bed.
         while speed > 2.0:
             filters.append("atempo=2.0")
             speed /= 2.0
@@ -49,12 +47,6 @@ class AudioMixer:
 
     @staticmethod
     def _build_scene_groups(sync_segments: Optional[List[Dict]], video_dur: float, tts_dur: float) -> List[Dict[str, float]]:
-        """Map transcript/TTS clocks into bounded scene-like retiming groups.
-
-        A group breaks on a meaningful transcript gap or after 30 seconds. This
-        prevents one global setpts stretch from accumulating drift on long
-        videos, while keeping short videos on the proven legacy path.
-        """
         usable = []
         for seg in sync_segments or []:
             try:
@@ -83,8 +75,6 @@ class AudioMixer:
 
         result = []
         for index, group in enumerate(groups):
-            # Keep every source frame. A transcript gap becomes part of the
-            # following group instead of being silently dropped at concat.
             source_start = 0.0 if index == 0 else groups[index - 1][-1][1]
             source_end = video_dur if index == len(groups) - 1 else group[-1][1]
             tts_start = 0.0 if index == 0 else groups[index - 1][-1][3]
@@ -104,6 +94,7 @@ class AudioMixer:
         enable_4k_filter: bool = False,
         mirror_mode_7s: bool = False,
         sync_segments: Optional[List[Dict]] = None,
+        **kwargs  # မလိုလားအပ်သော parameter များကြောင့် error မတက်စေရန် ထည့်သွင်းထားခြင်း
     ) -> Path:
         video_path = Path(video_path)
         tts_audio_path = Path(tts_audio_path)
@@ -132,7 +123,6 @@ class AudioMixer:
             video_dur = tts_dur
 
         scene_groups = self._build_scene_groups(sync_segments, video_dur, tts_dur)
-        # Keep the legacy global factor for short videos and as a safe fallback.
         pts_factor = tts_dur / video_dur
 
         if self.progress_callback:
@@ -154,15 +144,11 @@ class AudioMixer:
         }
         resolution_key = str(resolution or "1080p").strip().lower()
         target_short_edge = resolution_sizes.get(resolution_key, 1080)
-        # Preserve orientation: the selected value is the portrait height or
-        # landscape width, with the other dimension calculated automatically.
         scale_filter = (
             f"scale=w='if(gte(iw,ih),{target_short_edge},-2)':"
             f"h='if(gte(iw,ih),-2,{target_short_edge})':flags=lanczos"
         )
 
-        # Build FFmpeg command. Legacy mode maps TTS alone; background mode
-        # keeps Demucs' music/effects stem underneath the new narration.
         input_args = ["-i", str(video_path), "-i", str(tts_audio_path)]
         if scene_groups:
             scene_parts = []
@@ -183,8 +169,8 @@ class AudioMixer:
         else:
             visual_filters = [f"setpts={pts_factor:.6f}*PTS", scale_filter]
             video_label = "[0:v]"
+
         if scene_groups:
-            # Effects are appended to the already retimed/scaled stream below.
             post_filters = []
             if enable_4k_filter:
                 post_filters.extend(["eq=contrast=1.08:brightness=0.02:saturation=1.08", "unsharp=5:5:0.45:5:5:0.0"])
@@ -194,22 +180,19 @@ class AudioMixer:
             filter_complex = ";".join(visual_filters) + f";{video_label}{','.join(post_filters)}[v]"
         else:
             if enable_4k_filter:
-                # A restrained enhancement pass: upscale/scale first, then
-                # improve contrast, color and perceived detail.
                 visual_filters.extend(["eq=contrast=1.08:brightness=0.02:saturation=1.08", "unsharp=5:5:0.45:5:5:0.0"])
             if mirror_mode_7s:
                 visual_filters.append("hflip=enable='gte(mod(t,14),7)'")
             visual_filters.append("fps=30")
             filter_complex = f"[0:v]{','.join(visual_filters)}[v]"
+
         audio_map = "1:a:0"
         if background_audio_path is not None:
             input_args += ["-i", str(background_audio_path)]
             background_dur = self._get_duration(Path(background_audio_path))
             if background_dur <= 0:
                 background_dur = tts_dur
-            # The source bed follows the rendered video source duration. It
-            # must be stretched/compressed to the same TTS duration before
-            # mixing, otherwise music/SFX will drift or end early.
+
             if scene_groups:
                 bg_parts = []
                 for index, group in enumerate(scene_groups):
@@ -236,6 +219,7 @@ class AudioMixer:
                 ";[bg][tts]amix=inputs=2:duration=longest:dropout_transition=0.2:normalize=0[a]"
             )
             audio_map = "[a]"
+
         cmd = [
             "ffmpeg", "-y", *input_args,
             "-filter_complex", filter_complex,
@@ -250,13 +234,6 @@ class AudioMixer:
             str(output_path)
         ]
         if resolution_key in {"tiktok1080", "tiktok2k"}:
-            # Use TikTok-compatible H.264 profiles while keeping the source
-            # aspect ratio. The final subtitle stage applies its bitrate cap
-            # when subtitles are enabled; this also covers subtitle-off jobs.
-            # Do not force a fixed H.264 level here.  The app preserves the
-            # source ratio, so square/ultrawide outputs can exceed the macroblock
-            # limits of a nominal TikTok level and NVENC rejects the encode.
-            # Let the selected encoder choose a valid level automatically.
             cmd[-1:-1] = ["-profile:v", "high", "-tag:v", "avc1"]
 
         if self.progress_callback:
@@ -273,7 +250,6 @@ class AudioMixer:
         )
 
         if result.returncode != 0:
-            # If GPU encoding failed, retry once with CPU libx264 as safety fallback
             if "h264_nvenc" in encoder_args or "h264_mf" in encoder_args:
                 print("[GPU WARNING] GPU rendering failed; retrying with CPU libx264.")
                 fallback_cmd = [
