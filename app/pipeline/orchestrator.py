@@ -201,7 +201,7 @@ class PipelineOrchestrator:
             transcriber = LocalWhisperTranscriber(
                 progress_callback=lambda msg, pct: self._notify(stage_3, 3, msg, pct)
             )
-            groq_res = transcriber.transcribe(original_audio, self.job_dir)
+            groq_res = transcriber.transcribe(original_audio, self.job_dir, precise_timing=dub_mode)
             transcript_duration = self._get_transcript_duration(groq_res, source_duration)
             self.artifacts["transcript_json"] = "transcript.json"
             self.artifacts["transcript_txt"] = "transcript.txt"
